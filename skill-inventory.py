@@ -5,16 +5,16 @@ skill-inventory — Manage your Claude Code skills across projects.
 Commands:
   skill-inventory scan       Scan projects and skills
   skill-inventory list       List all skills found
-  skill-inventory audit      Analyze with Claude and save report (needs ANTHROPIC_API_KEY)
-  skill-inventory clean      Interactive cleanup from last audit report (no API needed)
+  skill-inventory audit      Analyze skills locally — zero API needed
+  skill-inventory clean      Interactive cleanup from last audit report
 """
 
-import os
 import sys
 import json
 import re
-import subprocess
 import shutil
+import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -62,26 +62,48 @@ def find_projects() -> list[Path]:
     return projects
 
 # ── Read skills from a directory ──────────────────────────────────────────────
+SKIP_NAMES = {"README.md", "LICENSE.md", "CHANGELOG.md", "CONTRIBUTING.md"}
+SKIP_DIRS  = {"_shared", "references", "pdf", "docs", "assets", "examples"}
+
 def read_skills_in_dir(skills_dir: Path) -> list[dict]:
-    """Read all skills (.md) in a given directory."""
+    """Read skill entry points from a directory.
+
+    A skill is either:
+      - A top-level .md file: skills/foo.md
+      - A SKILL.md inside a direct subfolder: skills/foo/SKILL.md
+
+    Sub-files, shared helpers, and reference docs are skipped.
+    """
     skills = []
     if not skills_dir.exists():
         return skills
-    SKIP_FILES = {"README.md", "LICENSE.md", "CHANGELOG.md", "CONTRIBUTING.md"}
-    for f in sorted(skills_dir.rglob("*.md")):
-        if f.name in SKIP_FILES or f.stem.upper() in ("LICENSE", "CHANGELOG"):
-            continue
+
+    scope = "global" if str(skills_dir).startswith(str(GLOBAL_SKILLS_DIR)) else "local"
+
+    def _add(f: Path, name: str) -> None:
         content = safe_read(f)
-        # If the file is named SKILL.md, use the parent directory name instead
-        name = f.parent.name if f.stem.upper() == "SKILL" else f.stem
         skills.append({
             "path": str(f),
             "name": name,
-            "scope": "global" if str(f).startswith(str(GLOBAL_SKILLS_DIR)) else "local",
+            "scope": scope,
             "project": _project_of(f),
-            "content": content[:2000],  # truncate for API
+            "content": content[:2000],
             "size": len(content),
+            "description": _parse_description(content),
         })
+
+    for entry in sorted(skills_dir.iterdir()):
+        if entry.name.startswith(".") or entry.name in SKIP_DIRS:
+            continue
+        if entry.is_file() and entry.suffix == ".md":
+            if entry.name not in SKIP_NAMES and entry.stem.upper() not in ("LICENSE", "CHANGELOG"):
+                _add(entry, entry.stem)
+        elif entry.is_dir():
+            skill_md = entry / "SKILL.md"
+            if skill_md.exists():
+                _add(skill_md, entry.name)
+            # else: directory without SKILL.md — skip (plugin, archive, etc.)
+
     return skills
 
 # ── Read plugin skills from cache ─────────────────────────────────────────────
@@ -138,8 +160,34 @@ def read_plugin_skills() -> list[dict]:
             "plugin_name": skill_name,
             "content": content[:2000],
             "size": len(content),
+            "description": _parse_description(content),
         })
     return skills
+
+def _parse_description(content: str) -> str:
+    """Extract the 'description' field from YAML frontmatter.
+    Handles inline values, quoted strings, and multi-line block scalars (> and |).
+    """
+    match = re.search(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
+    if not match:
+        return ""
+    lines = match.group(1).splitlines()
+    for i, line in enumerate(lines):
+        if line.lower().startswith("description:"):
+            value = line.split(":", 1)[1].strip().strip('"').strip("'")
+            # YAML block scalars: > or | mean the value is on the next indented lines
+            if value in (">", "|", "|-", ">-", ">+", "|+"):
+                desc_lines = []
+                for j in range(i + 1, len(lines)):
+                    if lines[j].startswith((" ", "\t")):
+                        desc_lines.append(lines[j].strip())
+                    elif lines[j].strip() == "":
+                        continue
+                    else:
+                        break
+                return " ".join(desc_lines)
+            return value
+    return ""
 
 def _project_of(path: Path) -> Optional[str]:
     """Return the project name a path belongs to."""
@@ -212,168 +260,142 @@ def build_snapshot() -> dict:
         "global_claude_md": safe_read(GLOBAL_CLAUDE_MD)[:1500],
     }
 
-# ── Call Claude API ───────────────────────────────────────────────────────────
-def call_claude(prompt: str, max_tokens: int = 1500) -> str:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        err("ANTHROPIC_API_KEY not set.")
-        err("Run: export ANTHROPIC_API_KEY=\"sk-ant-...\"")
-        sys.exit(1)
+# ── Similarity helpers ────────────────────────────────────────────────────────
+def _similarity(a: str, b: str) -> float:
+    """Return 0.0–1.0 similarity between two strings (case-insensitive)."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    })
+def _normalize_name(name: str) -> str:
+    """Strip namespace prefix and separators for name comparison."""
+    name = name.split(":")[-1]          # remove namespace (vercel:foo → foo)
+    return re.sub(r"[-_]", " ", name)   # hyphens/underscores → spaces
 
-    result = subprocess.run(
-        ["curl", "-sf",
-         "https://api.anthropic.com/v1/messages",
-         "-H", "Content-Type: application/json",
-         "-H", f"x-api-key: {api_key}",
-         "-H", "anthropic-version: 2023-06-01",
-         "-d", payload],
-        capture_output=True, text=True
-    )
+# ── Audit: local analysis, zero API ──────────────────────────────────────────
+DUPLICATE_DESC_THRESHOLD = 0.80   # description similarity alone → duplicate
+DUPLICATE_NAME_THRESHOLD = 0.90   # name similarity alone → duplicate
+COMBINED_THRESHOLD       = 0.70   # desc + name both above this → duplicate
+MIN_DESC_LENGTH          = 25     # min chars for a description to count
+EMPTY_SIZE_THRESHOLD     = 100    # bytes → flagged as empty
 
-    if result.returncode != 0:
-        err("Network error calling the API.")
-        sys.exit(1)
-
-    try:
-        data = json.loads(result.stdout)
-        if "error" in data:
-            err(f"API error: {data['error']['message']}")
-            sys.exit(1)
-        return data["content"][0]["text"]
-    except Exception as e:
-        err(f"Unexpected API response: {e}")
-        sys.exit(1)
-
-# ── Audit: analyze with Claude, save report ───────────────────────────────────
 def cmd_audit(snapshot: dict) -> None:
-    h1("▸ Auditing skills with Claude")
+    h1("▸ Auditing skills  (local analysis — no API)")
 
-    skills_summary = [
-        {
-            "name": s["name"],
-            "scope": s["scope"],
-            "project": s.get("project"),
-            "path": s["path"],
-            "preview": s["content"][:400],
-        }
-        for s in snapshot["skills"]
-    ]
+    skills = [s for s in snapshot["skills"] if s["scope"] != "plugin"]
+    dim(f"  Comparing {len(skills)} skills by description and name…")
 
-    projects_summary = [
-        {
-            "name": p["name"],
-            "local_skills": p["local_skills"],
-            "claude_md_excerpt": p["claude_md"][:600],
-        }
-        for p in snapshot["projects"]
-    ]
+    duplicates: list[dict] = []
+    warnings:   list[dict] = []
+    seen_pairs: set[frozenset] = set()
 
-    prompt = f"""Analyze this Claude Code skills inventory and detect issues.
+    for i, a in enumerate(skills):
+        # ── Flag empty / no-description skills ───────────────────────────────
+        if a["size"] < EMPTY_SIZE_THRESHOLD:
+            warnings.append({
+                "path": a["path"],
+                "reason": f"Very small skill ({a['size']} bytes) — may be empty or a stub",
+            })
+            continue
+        if not a["description"]:
+            warnings.append({
+                "path": a["path"],
+                "reason": "No 'description' field in frontmatter",
+            })
 
-## Skills found
-{json.dumps(skills_summary, indent=2, ensure_ascii=False)}
+        # ── Compare with every other skill ───────────────────────────────────
+        for b in skills[i + 1:]:
+            pair = frozenset([a["path"], b["path"]])
+            if pair in seen_pairs:
+                continue
 
-## Projects and their CLAUDE.md
-{json.dumps(projects_summary, indent=2, ensure_ascii=False)}
+            # Only use description if both are meaningful (not a stub or block scalar remnant)
+            a_desc = a["description"] if len(a["description"]) >= MIN_DESC_LENGTH else ""
+            b_desc = b["description"] if len(b["description"]) >= MIN_DESC_LENGTH else ""
+            desc_sim = _similarity(a_desc, b_desc)
+            name_sim = _similarity(
+                _normalize_name(a["name"]),
+                _normalize_name(b["name"])
+            )
 
-## Global CLAUDE.md
-{snapshot['global_claude_md']}
+            is_dup = (
+                desc_sim >= DUPLICATE_DESC_THRESHOLD
+                or name_sim >= DUPLICATE_NAME_THRESHOLD
+                or (desc_sim >= COMBINED_THRESHOLD and name_sim >= COMBINED_THRESHOLD)
+            )
+            if is_dup:
+                seen_pairs.add(pair)
+                # Keep the one with more content (likely more complete)
+                keep, remove = (a, b) if a["size"] >= b["size"] else (b, a)
+                reason = (
+                    f"Descriptions {int(desc_sim * 100)}% similar"
+                    if desc_sim >= DUPLICATE_DESC_THRESHOLD
+                    else f"Names {int(name_sim * 100)}% similar"
+                )
+                duplicates.append({
+                    "group": [a["path"], b["path"]],
+                    "reason": reason,
+                    "desc_a": a["description"] or "(none)",
+                    "desc_b": b["description"] or "(none)",
+                    "keep": keep["path"],
+                    "remove": [remove["path"]],
+                })
 
-## Task
-Respond ONLY in valid JSON with this exact structure (no markdown, no explanations):
-{{
-  "duplicates": [
-    {{
-      "group": ["path/skill-a.md", "path/skill-b.md"],
-      "reason": "Both do X",
-      "keep": "path/skill-a.md",
-      "remove": ["path/skill-b.md"]
-    }}
-  ],
-  "unused": [
-    {{
-      "path": "path/skill.md",
-      "reason": "Not referenced in any CLAUDE.md or active project"
-    }}
-  ],
-  "summary": "Brief sentence about overall state"
-}}
-
-If no duplicates or unused, return empty arrays. JSON only, nothing else."""
-
-    dim("  Querying Claude for semantic analysis...")
-    raw = call_claude(prompt, max_tokens=1200)
-
-    # Strip possible markdown
-    raw = re.sub(r"```json|```", "", raw).strip()
-
-    try:
-        result = json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            result = json.loads(match.group())
-        else:
-            err("Could not parse Claude's response.")
-            print(f"{DIM}{raw[:500]}{R}")
-            return
-
-    # Build action list
+    # ── Build action list ─────────────────────────────────────────────────────
     actions = [
         {"action": "remove", "path": r, "reason": g["reason"], "type": "duplicate"}
-        for g in result.get("duplicates", []) for r in g.get("remove", [])
+        for g in duplicates for r in g["remove"]
     ] + [
-        {"action": "remove", "path": s["path"], "reason": s["reason"], "type": "unused"}
-        for s in result.get("unused", [])
+        {"action": "warn", "path": w["path"], "reason": w["reason"], "type": "warning"}
+        for w in warnings
     ]
 
+    total_issues = len(duplicates) + len(warnings)
+    summary = (
+        f"{len(duplicates)} duplicate group(s) and {len(warnings)} warning(s) found."
+        if total_issues else "All clean — no duplicates or issues detected."
+    )
+
     # ── Save report ───────────────────────────────────────────────────────────
-    import datetime
     report = {
         "generated_at": datetime.datetime.now().isoformat(),
-        "summary": result.get("summary", ""),
-        "duplicates": result.get("duplicates", []),
-        "unused": result.get("unused", []),
+        "method": "local (difflib — no API)",
+        "summary": summary,
+        "duplicates": duplicates,
+        "warnings": warnings,
         "actions": actions,
     }
     REPORT_FILE.write_text(json.dumps(report, indent=2, ensure_ascii=False))
 
     # ── Display results ───────────────────────────────────────────────────────
     sep()
-    if report["summary"]:
-        print(f"\n  {report['summary']}\n")
+    print(f"\n  {summary}\n")
 
-    duplicates = result.get("duplicates", [])
-    unused = result.get("unused", [])
-
-    if not duplicates and not unused:
-        ok("No issues found. All clean.")
+    if not duplicates and not warnings:
         ok(f"Report saved → {_short(str(REPORT_FILE))}")
         return
 
     if duplicates:
         h2(f"  Duplicate skills ({len(duplicates)} group(s))")
         for i, g in enumerate(duplicates, 1):
-            print(f"\n  {BOLD}[{i}] Duplicate{R}")
-            print(f"      Reason: {g['reason']}")
+            print(f"\n  {BOLD}[{i}] Duplicate{R}  {DIM}{g['reason']}{R}")
             print(f"      {GREEN}Keep:{R}    {_short(g['keep'])}")
-            for r in g.get("remove", []):
+            if g["desc_a"]:
+                print(f"      {DIM}desc: {g['desc_a'][:80]}{R}")
+            for r in g["remove"]:
                 print(f"      {RED}Remove:{R}  {_short(r)}")
+            if g["desc_b"]:
+                print(f"      {DIM}desc: {g['desc_b'][:80]}{R}")
 
-    if unused:
-        h2(f"  Unused skills ({len(unused)})")
-        for s in unused:
-            warn(f"{_short(s['path'])}  —  {s['reason']}")
+    if warnings:
+        h2(f"  Warnings ({len(warnings)})")
+        for w in warnings:
+            warn(f"{_short(w['path'])}")
+            dim(f"    {w['reason']}")
 
     sep()
     ok(f"Report saved → {_short(str(REPORT_FILE))}")
-    info(f"Run  {CYAN}skill-inventory clean{R}  to apply changes (no API needed)")
+    info(f"Run  {CYAN}skill-inventory clean{R}  to apply changes")
 
 # ── Interactive cleanup — reads report, zero API ───────────────────────────────
 def cmd_clean() -> None:
@@ -583,12 +605,12 @@ def main():
 {BOLD}Commands:{R}
   {CYAN}scan{R}    Scan projects and skills (no analysis)
   {CYAN}list{R}    List all skills found
-  {CYAN}audit{R}   Analyze with Claude → save report  {DIM}(needs ANTHROPIC_API_KEY){R}
+  {CYAN}audit{R}   Local analysis → save report        {DIM}(no API needed){R}
   {CYAN}clean{R}   Interactive cleanup from report     {DIM}(no API needed){R}
 
 {BOLD}Workflow:{R}
-  1. skill-inventory audit    # run once, costs ~1 API call
-  2. skill-inventory clean    # interactive, no API, repeatable
+  1. skill-inventory audit    # runs locally, zero API cost
+  2. skill-inventory clean    # interactive, repeatable
 
 {BOLD}Report:{R} {_short(str(REPORT_FILE))}  [{report_status}]
 
