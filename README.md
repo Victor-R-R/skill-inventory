@@ -8,8 +8,8 @@
 
 - 📦 **Inventories all skill sources** — `~/.claude/skills/`, project-local skills, and installed plugins
 - 🏷️ **Categorizes automatically** — SEO, LinkedIn, Testing, Vercel, SDD, Security, and more
-- 🔍 **Semantic audit via Claude** — detects duplicates and unused skills across your entire setup
-- 🧹 **Zero-API cleanup** — run `audit` once, then `clean` as many times as you want without touching the API
+- 🔍 **Local duplicate detection** — compares skill descriptions with `difflib`, zero API needed
+- 🧹 **Zero-API cleanup** — run `audit` once, then `clean` as many times as you want
 - 💾 **Safe deletions** — every removed skill is backed up before deletion
 
 ---
@@ -19,8 +19,8 @@
 | Dependency | Version |
 |------------|---------|
 | Python | 3.9+ |
-| curl | any |
-| ANTHROPIC_API_KEY | for `audit` only |
+
+No API key needed. Everything runs locally.
 
 ---
 
@@ -34,8 +34,6 @@ bash install.sh
 
 The installer copies `skill-inventory` to `~/.local/bin/` and checks your PATH.
 
-> **Note:** `ANTHROPIC_API_KEY` is only needed when running `audit`. All other commands work without it.
-
 ---
 
 ## 🛠️ Commands
@@ -44,7 +42,7 @@ The installer copies `skill-inventory` to `~/.local/bin/` and checks your PATH.
 |---------|-------------|------------|
 | `scan`  | Discover projects and count skills | ❌ |
 | `list`  | Full categorized inventory | ❌ |
-| `audit` | Semantic analysis → saves report | ✅ |
+| `audit` | Local analysis → saves report | ❌ |
 | `clean` | Interactive cleanup from report | ❌ |
 
 ---
@@ -60,9 +58,9 @@ skill-inventory scan
 ```
 ▸ Scanning system
   ·  Projects found: 10
-  ·  Global skills (~/.claude/skills/): 84
+  ·  Global skills (~/.claude/skills/): 62
   ·  Plugin skills (~/.claude/plugins/cache/): 122
-  ·  Total skills: 230
+  ·  Total skills: 205
 ```
 
 ---
@@ -99,32 +97,34 @@ skill-inventory list
 
 ---
 
-### 🧠 `audit` — AI-powered analysis
+### 🔍 `audit` — Local duplicate detection
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
 skill-inventory audit
 ```
 
-Uses **Claude Haiku** to semantically compare all your skills and detect:
-- 🔁 **Duplicates** — two skills doing the same thing with different names
-- 💤 **Unused** — skills not referenced in any active project
+Reads every skill's YAML frontmatter description and compares all pairs using `difflib.SequenceMatcher`. No API call, no tokens, instant results.
+
+Detects:
+- 🔁 **Duplicates** — two skills with very similar descriptions or names
+- ⚠️ **Stubs** — skills under 100 bytes with no real content
 
 Results are saved to `~/.claude/skill-inventory-report.json`.
 
 ```
-▸ Auditing skills with Claude
-  ·  Querying Claude for semantic analysis...
+▸ Auditing skills  (local analysis — no API)
+  Comparing 83 skills by description and name…
 
-  Duplicate skills (1 group)
+  2 duplicate group(s) and 0 warning(s) found.
 
-  [1] Duplicate
-      Reason: Both handle SEO page audits
-      Keep:    ~/.claude/skills/seo-audit/SKILL.md
-      Remove:  ~/.claude/skills/audit-seo/SKILL.md
+  [1] Duplicate  Descriptions 89% similar
+      Keep:    ~/.claude/skills/prfeature/SKILL.md
+      desc: Create a feature branch, commit staged changes, push, open PR...
+      Remove:  ~/.claude/skills/prfix/SKILL.md
+      desc: Create a fix branch, commit staged changes, push, open PR...
 
   ✓  Report saved → ~/.claude/skill-inventory-report.json
-  ·  Run skill-inventory clean to apply changes (no API needed)
+  ·  Run skill-inventory clean to apply changes
 ```
 
 ---
@@ -143,13 +143,13 @@ Reads the saved report — **no API call**. Review and delete skills one by one:
   2 action(s) proposed. Let's review them one by one.
 
   [1/2]  ⚠ Duplicate
-  Skill:   ~/.claude/skills/audit-seo/SKILL.md
-  Reason:  Both handle SEO page audits
+  Skill:   ~/.claude/skills/prfix/SKILL.md
+  Reason:  Descriptions 89% similar
 
   Preview:
   ---
-  name: audit-seo
-  description: Audits SEO issues on a page
+  name: prfix
+  description: Create a fix branch, commit staged changes, push, open PR...
   ---
 
   Delete? [y/N/full view]: y
@@ -163,10 +163,10 @@ Every deleted file is backed up to `~/.claude/skills-backup/` before removal.
 ## 🔄 Recommended workflow
 
 ```bash
-# Step 1 — run once (uses API)
+# Step 1 — analyze (zero API, instant)
 skill-inventory audit
 
-# Step 2 — repeat as needed (zero API)
+# Step 2 — clean up (repeat as needed)
 skill-inventory clean
 
 # Step 3 — re-audit after cleanup
@@ -193,15 +193,22 @@ skill-inventory <cmd>
        │
        ▼
  build_snapshot()
-       ├── ~/.claude/skills/          → global skills
+       ├── ~/.claude/skills/          → global skills (SKILL.md or flat .md)
        ├── ~/.claude/plugins/cache/   → plugin skills (latest version only)
        └── ~/*/skills/                → local project skills
        │
        ├── scan   → print summary
        ├── list   → categorized display (by category / project / namespace)
-       ├── audit  → Claude Haiku → ~/.claude/skill-inventory-report.json
+       ├── audit  → difflib comparison → ~/.claude/skill-inventory-report.json
        └── clean  → read report → interactive delete + backup (zero API)
 ```
+
+### How duplicate detection works
+
+1. Extract `description:` from each skill's YAML frontmatter (handles inline values and `>` / `|` block scalars)
+2. Normalize skill names (strip namespace prefix, replace `-`/`_` with spaces)
+3. Compare every pair with `difflib.SequenceMatcher`
+4. Flag as duplicate if description similarity ≥ 80%, name similarity ≥ 90%, or both ≥ 70%
 
 ---
 
