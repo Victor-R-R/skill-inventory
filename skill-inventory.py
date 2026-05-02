@@ -981,9 +981,16 @@ def cmd_match(github_url: str, snapshot: dict) -> None:
                 return True
         return False
 
+    # Skills present in 2+ plugin namespaces are already "multi-covered" — no need to install globally
+    plugin_ns_by_name: dict[str, set] = {}
+    for sk in plugin_skills:
+        pname = sk.get("plugin_name", sk["name"])
+        plugin_ns_by_name.setdefault(pname, set()).add(sk.get("namespace", "?"))
+    multi_covered = {name for name, nss in plugin_ns_by_name.items() if len(nss) > 1}
+
     plugins_only = [
         (score, sk) for score, sk in deduped_plugins
-        if not _covered_by_own(sk)
+        if not _covered_by_own(sk) and sk.get("plugin_name", sk["name"]) not in multi_covered
     ]
 
     # ── Gap detection ─────────────────────────────────────────────────────────
