@@ -275,6 +275,60 @@ Saves `UNUSED` skills to `~/.claude/skill-inventory-report.json` so `clean` can 
 
 ---
 
+## 📥 install-skills
+
+A companion bash utility that copies plugin skills into `~/.claude/skills/` so they become globally available across all projects.
+
+### Installation
+
+The script is included in this repo. Copy it to any directory in your `PATH`:
+
+```bash
+cp install-skills ~/.local/bin/install-skills
+chmod +x ~/.local/bin/install-skills
+```
+
+### Commands
+
+```bash
+# Interactive — choose which skills to install
+install-skills
+
+# Install specific skills by name
+install-skills vercel-cli shadcn
+
+# Install ALL available plugin skills not yet in globals
+install-skills --all
+
+# List what's available without installing
+install-skills --list
+
+# Install skills recommended by skill-inventory match
+install-skills --from-match github.com/owner/repo
+```
+
+### `--from-match` — Install gap recommendations automatically
+
+The most powerful mode. Runs `skill-inventory match` internally, extracts the `[↓ INSTALL]` candidates, and installs each one that exists in your plugin cache:
+
+```bash
+install-skills --from-match github.com/mattpocock/skills
+```
+
+```
+Running skill-inventory match github.com/mattpocock/skills…
+
+Installing recommended skills…
+
+  ✓ systematic-debugging
+  ✓ next-forge
+  ~ shadcn — already installed, skipping
+
+Done — 2 installed, 1 already present
+```
+
+---
+
 ## 🔄 Recommended workflow
 
 ```bash
@@ -286,8 +340,9 @@ skill-inventory clean --yes
 skill-inventory prune
 skill-inventory clean --yes
 
-# Step 3 — explore a repo for gaps
+# Step 3 — explore a repo for gaps and install what's missing
 skill-inventory match github.com/owner/repo
+install-skills --from-match github.com/owner/repo
 
 # Step 4 — re-audit to confirm
 skill-inventory audit
